@@ -4,7 +4,7 @@ from pymavlink import mavutil
 # ------------ CONFIG ------------
 GCS_TARGET = 'udpout:127.0.0.1:14550'    # GCS on same PC
 #PI_TARGET  = 'udpout:10.113.51.25:14551'      # <-- replace with your Pi’s IP
-PI_TARGET  = 'udpout:192.168.1.196:14551'      # <-- replace with your Pi’s IP
+PI_TARGET  = 'udpout:192.168.1.193:14551'      # <-- replace with your Pi’s IP
 
 SOURCE_SYS  = 1
 SOURCE_COMP = 1
@@ -109,6 +109,47 @@ def send_statustext(c, text, sev=mavutil.mavlink.MAV_SEVERITY_INFO):
     c.mav.statustext_send(sev, text.encode("utf-8")[:50])
 
 
+# ---- SERVO_OUTPUT_RAW injection (added) -------------------------------------
+SERVO_HZ   = 10
+WINCH_CH   = 9           # change if your winch uses a different channel (1-16)
+PWM_ON     = 1900        # "active / spool"
+PWM_OFF    = 1100        # neutral/off
+PWM_OTHER  = 1500        # other channels neutral
+
+def _send_servo_output_raw(c, t_us, port, values8):
+    """Robust sender: try 16-field form first, else fallback to 8-field per-port."""
+    try:
+        # Build full 16 values with WINCH_CH reflected
+        vals16 = [PWM_OTHER]*16
+        # Merge provided 8-ch port values
+        if port == 0:
+            vals16[:8] = values8[:8]
+        else:
+            vals16[8:16] = values8[:8]
+        c.mav.servo_output_raw_send(
+            t_us, port,
+            vals16[0], vals16[1], vals16[2], vals16[3], vals16[4], vals16[5], vals16[6], vals16[7],
+            vals16[8], vals16[9], vals16[10], vals16[11], vals16[12], vals16[13], vals16[14], vals16[15]
+        )
+    except TypeError:
+        c.mav.servo_output_raw_send(
+            t_us, port,
+            values8[0], values8[1], values8[2], values8[3],
+            values8[4], values8[5], values8[6], values8[7]
+        )
+
+def send_servo_output(c, t_us, servo_on):
+    target_pwm = PWM_ON if servo_on else PWM_OFF
+    p0 = [PWM_OTHER]*8
+    p1 = [PWM_OTHER]*8
+    if 1 <= WINCH_CH <= 8:
+        p0[WINCH_CH-1] = target_pwm
+    elif 9 <= WINCH_CH <= 16:
+        p1[WINCH_CH-9] = target_pwm
+    _send_servo_output_raw(c, t_us, 0, p0)
+    _send_servo_output_raw(c, t_us, 1, p1)
+# -----------------------------------------------------------------------------    
+
 def main():
     print(f"Streaming to:\n  GCS={GCS_TARGET}\n  PI ={PI_TARGET}")
     t0 = time.time()
@@ -116,14 +157,28 @@ def main():
     hb_dt   = 1.0 / HB_HZ
     armed   = True
 
+    # --- added: servo simulation state ---
+    servo_on = False
+    takeoff_off_deadline = None
+
+
     for cycle in range(1, N_CYCLES + 1):
         print(f"\n=== Starting cycle {cycle}/{N_CYCLES} ===")
         did_disarm_announce = False
 
         for label, landed, dur, lat, lon, rel_alt in PHASES:
-            if label == "LANDING":
-                print(">>> STATUSTEXT: Sampling landing")
-                update_all_endpts(lambda endpt: send_statustext(endpt, "Sampling landing"))
+            if label == "LANDED":
+                print(">>> STATUSTEXT: Landed — SERVO ON")
+                update_all_endpts(lambda endpt: send_statustext(endpt, "Landed — SERVO ON"))
+                print(">>> SERVO ON (after landing)")
+                # turn servo ON after landing (on ground)
+                servo_on = True
+                takeoff_off_deadline = None
+            elif "TAKEOFF" in label:
+                takeoff_off_deadline = time.time() + 2.0
+                update_all_endpts(lambda endpt: send_statustext(endpt, "Takeoff — will SERVO OFF in 2s"))
+                print(">>> Takeoff detected — will SERVO OFF in 2s")
+
             if label == "FINAL_LANDING":
                 print(">>> STATUSTEXT: Mission complete")
                 update_all_endpts(lambda endpt: send_statustext(endpt, "Mission complete"))
@@ -134,6 +189,9 @@ def main():
             ext_dt  = 1.0 / EXTSYS_HZ
             next_gps = 0.0
             next_ext = 0.0
+            # added: servo timing
+            servo_dt = 1.0 / SERVO_HZ
+            next_servo = 0.0
 
             while (time.time() - start) < dur:
                 now = time.time()
@@ -154,6 +212,19 @@ def main():
                     update_all_endpts(lambda endpt: send_extsys(endpt, landed))
                     next_ext += ext_dt
 
+
+                # added: after-takeoff 2s OFF
+                if takeoff_off_deadline is not None and now >= takeoff_off_deadline:
+                    servo_on = False
+                    takeoff_off_deadline = None
+                    update_all_endpts(lambda endpt: send_statustext(endpt, "SERVO OFF (2s post-takeoff)"))
+                    print(">>> SERVO OFF (2s post-takeoff)")
+
+                # added: SERVO_OUTPUT_RAW @10Hz
+                if (now - start) >= next_servo:
+                    t_us = int((now - t0) * 1e6)
+                    update_all_endpts(lambda endpt: send_servo_output(endpt, t_us, servo_on))
+                    next_servo += servo_dt
                 time.sleep(0.01)
 
             if label == "FINAL_LANDING" and not did_disarm_announce:
